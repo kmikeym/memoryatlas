@@ -22,7 +22,7 @@ def read_voice_memos(db_path: Path) -> List[Asset]:
     Opens the database in read-only mode (immutable=1) to avoid
     any writes or locks that could interfere with Voice Memos.
     """
-    uri = f"file:{db_path}?mode=ro&immutable=1"
+    uri = f"file:{db_path}?mode=ro"
     conn = sqlite3.connect(uri, uri=True)
     conn.row_factory = sqlite3.Row
     try:

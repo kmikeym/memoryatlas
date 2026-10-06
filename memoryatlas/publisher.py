@@ -1,11 +1,84 @@
 """Generate Obsidian markdown notes from atlas.db assets."""
 import hashlib
+import json
 from pathlib import Path
 
 from .config import Config
 from .db import AtlasDB
 from .models import Asset
 from .util import write_jsonl, row_to_asset
+
+
+def _format_transcript(transcript_path: str) -> str:
+    """Format transcript with paragraph breaks using segment timestamps.
+
+    Inserts a paragraph break when there's a gap > 1.5 seconds between
+    segments, or every ~4 sentences if no segment data is available.
+    """
+    txt_path = Path(transcript_path)
+    json_path = txt_path.with_suffix(".json")
+
+    # Try segment-based formatting first
+    if json_path.exists():
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        segments = data.get("segments", [])
+        if segments:
+            paragraphs = []
+            current = []
+            current_len = 0
+            for i, seg in enumerate(segments):
+                seg_text = seg["text"].strip()
+                current.append(seg_text)
+                current_len += len(seg_text)
+                # Break on: pause > 1.5s OR paragraph getting long (>500 chars)
+                # at a sentence boundary
+                should_break = False
+                if i < len(segments) - 1:
+                    gap = segments[i + 1]["start"] - seg["end"]
+                    if gap > 1.5:
+                        should_break = True
+                    elif current_len > 500 and seg_text[-1:] in ".?!":
+                        should_break = True
+                if should_break:
+                    paragraphs.append(" ".join(current))
+                    current = []
+                    current_len = 0
+            if current:
+                paragraphs.append(" ".join(current))
+            return "\n\n".join(paragraphs)
+
+    # Fallback: sentence-based paragraph breaks
+    text = txt_path.read_text(encoding="utf-8").strip()
+    if len(text) < 200:
+        return text
+
+    sentences = []
+    for part in text.replace("? ", "?\n").replace(". ", ".\n").replace("! ", "!\n").split("\n"):
+        part = part.strip()
+        if part:
+            sentences.append(part)
+
+    paragraphs = []
+    for i in range(0, len(sentences), 4):
+        paragraphs.append(" ".join(sentences[i:i + 4]))
+    return "\n\n".join(paragraphs)
+
+
+def _is_3mr_episode(asset: Asset) -> bool:
+    """Detect if an asset is a 3 Minute Review podcast episode."""
+    title = (asset.title or "").lower()
+    if "3mr" in title or "3 minute review" in title or "three minute review" in title:
+        return True
+    # Check transcript for 3MR references
+    if asset.transcript_path:
+        try:
+            text = Path(asset.transcript_path).read_text(encoding="utf-8").lower()
+            if "3 minute review" in text or "three minute review" in text:
+                return True
+        except Exception:
+            pass
+    return False
 
 
 def generate_note_content(asset: Asset) -> str:
@@ -33,6 +106,9 @@ def generate_note_content(asset: Asset) -> str:
     tags = ["memoryatlas", f"memoryatlas/{asset.source_type.replace('_', '-')}"]
     if asset.transcript_status == "done":
         tags.append("memoryatlas/transcribed")
+    if _is_3mr_episode(asset):
+        tags.append("3mr")
+        lines.append(f"series: 3MR")
     lines.append(f"tags: [{', '.join(tags)}]")
 
     lines.append(f"atlas-id: {asset.short_id}")
@@ -61,17 +137,6 @@ def generate_note_content(asset: Asset) -> str:
         lines.append(f"| Location | {asset.place} |")
     lines.append("")
 
-    if asset.transcript_status == "done" and asset.transcript_path:
-        lines.append("## Transcript")
-        lines.append("")
-        lines.append(f"[Open transcript](file://{asset.transcript_path})")
-        lines.append("")
-    else:
-        lines.append("## Transcript")
-        lines.append("")
-        lines.append("*Pending transcription.*")
-        lines.append("")
-
     if asset.summary:
         lines.append("## Summary")
         lines.append("")
@@ -88,6 +153,21 @@ def generate_note_content(asset: Asset) -> str:
         if asset.sentiment:
             lines.append(f"**Sentiment**: {asset.sentiment}")
             lines.append("")
+
+    if asset.transcript_status == "done" and asset.transcript_path:
+        lines.append("## Transcript")
+        lines.append("")
+        try:
+            transcript_text = _format_transcript(asset.transcript_path)
+            lines.append(transcript_text)
+        except Exception:
+            lines.append(f"[Open transcript](file://{asset.transcript_path})")
+        lines.append("")
+    else:
+        lines.append("## Transcript")
+        lines.append("")
+        lines.append("*Pending transcription.*")
+        lines.append("")
 
     # Philological enhancement (polished transcripts)
     if asset.translated_text:
@@ -118,6 +198,10 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
 
     voice_dir = config.atlas_vault_dir / "voice"
     voice_dir.mkdir(parents=True, exist_ok=True)
+    tmr_dir = config.atlas_vault_dir / "3MR"
+    tmr_dir.mkdir(parents=True, exist_ok=True)
+    new_dir = config.atlas_vault_dir / "new"
+    new_dir.mkdir(parents=True, exist_ok=True)
 
     rows = db.get_all_assets() if force else db.get_unpublished_assets()
 
@@ -127,9 +211,27 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
             content = generate_note_content(asset)
             content_hash = hashlib.sha256(content.encode()).hexdigest()[:16]
 
+            # Route: already published → keep location, new → new/
+            # 3MR is a closed archive (no new episodes) — folder placement for
+            # existing 3MR notes is preserved via the "already published" branch
+            # below, same as any other note. No content-based re-routing here:
+            # that was the mechanism that produced duplicate files (old copy left
+            # behind, new copy written to a freshly-detected folder) whenever
+            # _is_3mr_episode()'s classification of an asset flipped between runs.
+            if asset.note_path:
+                # Already published — keep in current folder
+                existing_subfolder = str(Path(asset.note_path).parent.name)
+                target_dir = config.atlas_vault_dir / existing_subfolder
+                target_dir.mkdir(parents=True, exist_ok=True)
+                subfolder = existing_subfolder
+            else:
+                # Brand new — goes to triage inbox
+                target_dir = new_dir
+                subfolder = "new"
+
             note_filename = asset.note_filename
-            note_path = voice_dir / note_filename
-            relative_note_path = f"MemoryAtlas/voice/{note_filename}"
+            note_path = target_dir / note_filename
+            relative_note_path = f"MemoryAtlas/{subfolder}/{note_filename}"
 
             if note_path.exists() and asset.note_hash == content_hash and not force:
                 counts["skipped"] += 1
