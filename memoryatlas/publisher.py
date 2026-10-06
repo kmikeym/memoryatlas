@@ -2,6 +2,7 @@
 import hashlib
 import json
 from pathlib import Path
+from typing import List, Optional
 
 from .config import Config
 from .db import AtlasDB
@@ -84,6 +85,10 @@ def _is_3mr_episode(asset: Asset) -> bool:
 def generate_note_content(asset: Asset) -> str:
     """Generate markdown content for a single asset note."""
     lines = ["---"]
+    # From atlas.db, so every regeneration writes it back (operations#717). Line 2 is
+    # where the fleet's hand-added flags sat, so existing private notes come out unchanged.
+    if asset.is_private:
+        lines.append("visibility: private")
     lines.append(f"uuid: {asset.id}")
     lines.append(f"type: {asset.source_type}")
 
@@ -190,8 +195,8 @@ def generate_note_content(asset: Asset) -> str:
 
 
 def publish(config: Config, db: AtlasDB, verbose: bool = False,
-            force: bool = False) -> dict:
-    """Generate Obsidian notes for assets."""
+            force: bool = False, asset_ids: Optional[List[str]] = None) -> dict:
+    """Generate Obsidian notes for assets. With asset_ids, only those notes."""
     counts = {"created": 0, "updated": 0, "skipped": 0, "error": 0}
 
     db.log_action("publish", "start")
@@ -203,7 +208,10 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
     new_dir = config.atlas_vault_dir / "new"
     new_dir.mkdir(parents=True, exist_ok=True)
 
-    rows = db.get_all_assets() if force else db.get_unpublished_assets()
+    if asset_ids:
+        rows = [r for r in (db.get_asset(i) for i in asset_ids) if r is not None]
+    else:
+        rows = db.get_all_assets() if force else db.get_unpublished_assets()
 
     for row in rows:
         try:
@@ -383,6 +391,7 @@ atlas info UUID  # Show details for one asset
 - `duration` / `duration_sec`: Human-readable and raw seconds
 - `transcribed` / `enriched`: Boolean status flags
 - `location` / `place`: GPS coordinates and place name (Phase 4)
+- `visibility`: `private` unless the recording is marked public in atlas.db. New recordings start private. Change it with `atlas visibility public|private ID`, never by editing the note: publish rewrites notes from the database.
 - `tags`: Always includes `memoryatlas`
 """
     about_path = config.atlas_vault_dir / "_About.md"

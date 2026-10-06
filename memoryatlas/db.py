@@ -47,6 +47,7 @@ CREATE TABLE IF NOT EXISTS asset (
     note_path       TEXT,
     published_at    TEXT,
     note_hash       TEXT,
+    visibility      TEXT CHECK(visibility IN ('private', 'public')),
     scanned_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
 );
@@ -107,6 +108,29 @@ class AtlasDB:
             (SCHEMA_VERSION,),
         )
         self.conn.commit()
+        self._migrate_visibility()
+
+    def _migrate_visibility(self):
+        """Add asset.visibility to a database created before it existed (operations#717).
+
+        Privacy has to live here, not in the note: publish rewrites notes from this table,
+        so a flag added to a note by hand was erased on the next run. NULL means
+        unreviewed and publishes as private. Rows already transcribed and published keep
+        their current state, which is public; everything else stays unreviewed.
+        """
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(asset)")]
+        if "visibility" in cols:
+            return
+        self.conn.execute(
+            "ALTER TABLE asset ADD COLUMN visibility TEXT "
+            "CHECK(visibility IN ('private', 'public'))"
+        )
+        cur = self.conn.execute(
+            "UPDATE asset SET visibility = 'public' "
+            "WHERE note_path IS NOT NULL AND transcript_status = 'done'"
+        )
+        self.log_action("migrate", "add_visibility", detail={"public": cur.rowcount})
+        self.conn.commit()
 
     def upsert_asset(self, asset: Asset) -> str:
         """Insert or update an asset. Returns 'insert', 'update', or 'skip'."""
@@ -163,6 +187,23 @@ class AtlasDB:
         return self.conn.execute(
             "SELECT * FROM asset ORDER BY recorded_at ASC"
         ).fetchall()
+
+    def resolve_asset_id(self, given: str) -> Optional[str]:
+        """Full id for an exact id or a unique prefix (e.g. the atlas-id); else None."""
+        if self.get_asset(given) is not None:
+            return given
+        rows = self.conn.execute(
+            "SELECT id FROM asset WHERE id LIKE ? LIMIT 2", (f"{given}%",)
+        ).fetchall()
+        return rows[0][0] if len(rows) == 1 else None
+
+    def set_visibility(self, asset_id: str, value: str):
+        if value not in ("private", "public"):
+            raise ValueError(f"visibility must be 'private' or 'public', not {value!r}")
+        self.conn.execute(
+            "UPDATE asset SET visibility = ? WHERE id = ?", (value, asset_id)
+        )
+        self.log_action("visibility", value, asset_id=asset_id)
 
     def get_asset(self, asset_id: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(

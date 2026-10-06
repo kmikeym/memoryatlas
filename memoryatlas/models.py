@@ -33,11 +33,17 @@ class Asset:
     restored_text: Optional[str] = None
     translated_text: Optional[str] = None
     polished_at: Optional[str] = None
+    visibility: Optional[str] = None  # 'private' | 'public' | None (unreviewed, treated as private)
     note_path: Optional[str] = None
     published_at: Optional[str] = None
     note_hash: Optional[str] = None
     scanned_at: Optional[str] = None
     updated_at: Optional[str] = None
+
+    @property
+    def is_private(self) -> bool:
+        """Fail closed: anything not explicitly marked public is private."""
+        return self.visibility != "public"
 
     @property
     def short_id(self) -> str:

@@ -55,6 +55,7 @@ def row_to_asset(row: sqlite3.Row) -> Asset:
         restored_text=row["restored_text"],
         translated_text=row["translated_text"],
         polished_at=row["polished_at"],
+        visibility=row["visibility"] if "visibility" in row.keys() else None,
         note_path=row["note_path"],
         published_at=row["published_at"],
         note_hash=row["note_hash"],

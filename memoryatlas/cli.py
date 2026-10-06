@@ -1,7 +1,7 @@
 """CLI interface using Typer."""
 import typer
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from .config import Config
 from .db import AtlasDB
@@ -72,6 +72,7 @@ def publish_cmd(
     config, db = _load(config_path)
 
     with db:
+        db.init_schema()
         if not index_only:
             print("Publishing notes...")
             counts = do_publish(config, db, verbose=verbose, force=force)
@@ -80,6 +81,39 @@ def publish_cmd(
         print("Updating index...")
         publish_index(config, db)
         print(f"  {config.atlas_vault_dir / '_Index.md'}")
+
+
+@app.command("visibility")
+def visibility_cmd(
+    value: str = typer.Argument(..., help="private or public"),
+    asset_ids: List[str] = typer.Argument(..., help="Asset UUIDs or unique prefixes (the atlas-id)"),
+    config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
+):
+    """Mark recordings private or public, then rewrite their notes.
+
+    Privacy lives in atlas.db so it survives every republish (operations#717).
+    New recordings start unreviewed, which publishes as private.
+    """
+    if value not in ("private", "public"):
+        print(f"Value must be 'private' or 'public', not {value!r}")
+        raise typer.Exit(2)
+    config, db = _load(config_path)
+
+    with db:
+        db.init_schema()
+        # Resolve every id before changing any, so a typo changes nothing.
+        ids = []
+        for given in asset_ids:
+            full = db.resolve_asset_id(given)
+            if full is None:
+                print(f"  Not found, or the prefix matches more than one: {given}")
+                raise typer.Exit(1)
+            ids.append(full)
+        for full in ids:
+            db.set_visibility(full, value)
+        db.conn.commit()
+        counts = do_publish(config, db, asset_ids=ids)
+        print(f"  {value}: {len(ids)} recording(s); notes: {format_count_line(counts)}")
 
 
 @app.command()
@@ -376,6 +410,7 @@ def info(
         print(f"  Format:     .{asset.file_format}")
         print(f"  Source:     {asset.source_path}")
         print(f"  Transcript: {asset.transcript_status}")
+        print(f"  Visibility: {asset.visibility or 'unreviewed (published as private)'}")
         print(f"  Note:       {asset.note_path or '(not published)'}")
 
 
