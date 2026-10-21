@@ -106,11 +106,13 @@ def transcribe_batch(
         try:
             start = time.time()
 
-            # Transcribe
+            # Transcribe. Each 30s window is decoded on its own: conditioned on the previous
+            # window, one "Thank you." primes the next and the loop runs over real speech.
             result = mlx_whisper.transcribe(
                 source_path,
                 path_or_hf_repo=model,
                 language=language,
+                condition_on_previous_text=False,
             )
 
             elapsed_transcribe = time.time() - start
