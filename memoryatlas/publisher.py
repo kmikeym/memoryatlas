@@ -1,7 +1,7 @@
 """Generate Obsidian markdown notes from atlas.db assets."""
 import hashlib
 import json
-import os
+import shutil
 from pathlib import Path
 from typing import List, Optional
 
@@ -214,22 +214,32 @@ def _note_path(config: Config, path: Path) -> str:
     return "/".join((NOTE_PATH_ROOT,) + path.relative_to(config.atlas_vault_dir).parts)
 
 
-def _write_atomic(path: Path, text: str):
-    """Write through a temp file, so a failed write never leaves a truncated note."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.atlas-tmp")
+def _write_note(path: Path, text: str):
+    """Write a note in place, restoring the old text if the write fails partway.
+
+    In place, not via a temp file and a rename: a rename would give the note a new
+    created time (Obsidian's sort, Dataview's file.ctime) and drop its Finder tags.
+    """
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return
+    backup = path.with_name(f".{path.name}.atlas-bak")
+    shutil.copyfile(path, backup)
     try:
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
-    finally:
-        if tmp.exists():
-            tmp.unlink()
+        path.write_text(text, encoding="utf-8")
+    except BaseException:
+        shutil.copyfile(backup, path)  # if this fails too, the backup stays for a person
+        backup.unlink()
+        raise
+    backup.unlink()
 
 
 def _frontmatter_uuid(path: Path) -> Optional[str]:
     """The uuid in a note's frontmatter, read without loading the rest of the file."""
     try:
-        with path.open(encoding="utf-8-sig") as f:
+        # errors="replace": a bad byte further down must not hide a note's uuid.
+        with path.open(encoding="utf-8-sig", errors="replace") as f:
             if f.readline().rstrip() != "---":
                 return None
             for line in f:
@@ -275,9 +285,13 @@ def _flag_copies(copies: List[Path]) -> int:
     """Add the privacy flag to every copy lacking it; return how many files changed."""
     changed = 0
     for path in copies:
-        text = path.read_text(encoding="utf-8")
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as e:
+            print(f"  could not read, so not flagged private: {path} ({e})")
+            continue
         if _with_private_flag(text) != text:
-            _write_atomic(path, _with_private_flag(text))
+            _write_note(path, _with_private_flag(text))
             changed += 1
     return changed
 
@@ -357,25 +371,22 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
 
             note_filename = note_path.name
             relative_note_path = _note_path(config, note_path)
-            moved = relative_note_path != asset.note_path
 
             if note_path.exists():
                 on_disk = note_path.read_text(encoding="utf-8")
                 if _content_hash(on_disk) == content_hash:
                     # Already holds exactly this text, so there is nothing to write. Record
-                    # the hash in case a run wrote it and stopped before recording.
-                    if asset.note_hash != content_hash:
-                        db.mark_published(asset.id, relative_note_path, content_hash)
-                    elif moved:
-                        db.set_note_path(asset.id, relative_note_path)
+                    # it anyway: a run may have written it and stopped before recording.
+                    db.mark_published(asset.id, relative_note_path, content_hash)
                     counts["skipped"] += 1
                     continue
                 if _content_hash(on_disk) != asset.note_hash:
                     # Edited by hand since publish last wrote it.
                     if asset.is_private:
                         _flag_copies([note_path])
-                    if moved:
-                        db.set_note_path(asset.id, relative_note_path)
+                    # Where it is now, and that it was handled, so an unforced run stops
+                    # picking it up. The hash stays what publish last wrote.
+                    db.mark_published(asset.id, relative_note_path, asset.note_hash)
                     counts["protected"] += 1
                     db.log_action("publish", "protected", asset_id=asset.id, detail={
                         "note_path": relative_note_path,
@@ -384,7 +395,7 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
                     continue
 
             is_new = not note_path.exists()
-            _write_atomic(note_path, content)
+            _write_note(note_path, content)
 
             db.mark_published(asset.id, relative_note_path, content_hash)
             action = "create" if is_new else "update"

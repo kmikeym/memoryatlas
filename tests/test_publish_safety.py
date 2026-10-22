@@ -218,12 +218,9 @@ def test_each_note_hash_is_committed_as_it_is_written(config, db, monkeypatch):
 def test_failed_write_leaves_note_intact(config, db, monkeypatch):
     _, note = _publish_one(config, db)
     before = note.read_bytes()
-    _change_data(db, "Never lands.")
+    # A lone surrogate cannot be encoded, so the write fails after the file was opened.
+    monkeypatch.setattr(publisher, "generate_note_content", lambda asset: "half a note \ud800")
 
-    def fail(*args):
-        raise OSError("disk went away")
-
-    monkeypatch.setattr(publisher.os, "replace", fail)
     counts = publish(config, db, force=True)
 
     assert counts["error"] == 1
@@ -231,7 +228,61 @@ def test_failed_write_leaves_note_intact(config, db, monkeypatch):
     assert [p.name for p in note.parent.iterdir()] == [note.name]
 
 
-@pytest.mark.parametrize("uuid_line, bom", [('uuid: "{id}"', ""), ("uuid: {id}", "﻿")])
+def test_rewrite_keeps_the_same_file(config, db):
+    _, note = _publish_one(config, db)
+    inode = note.stat().st_ino
+    _change_data(db, "Rewritten in place.")
+
+    publish(config, db, force=True)
+
+    assert "Rewritten in place." in note.read_text()
+    assert note.stat().st_ino == inode
+
+
+def test_unreadable_copy_does_not_stop_flagging(config, db, capsys):
+    _, note = _publish_one(config, db)
+    vault = config.atlas_vault_dir
+    good = vault / "voice" / "Readable copy.md"
+    bad = vault / "3MR" / "Unreadable copy.md"
+    good.write_text(note.read_text())
+    bad.write_bytes(note.read_bytes() + b"\nbad byte: \xff\n")
+    _make_private(db)
+
+    changed = publisher.flag_private_copies(config, db, [ID])
+
+    assert _has_flag(good)
+    assert changed == 2  # the recorded note and the readable copy
+    assert bad.name in capsys.readouterr().out
+
+
+def test_unreadable_copy_counts_toward_a_conflict(config, db):
+    _, note = _publish_one(config, db)
+    moved = config.atlas_vault_dir / "voice" / note.name
+    moved.write_text(note.read_text())
+    (config.atlas_vault_dir / "3MR" / "Unreadable copy.md").write_bytes(
+        note.read_bytes().replace(b"type:", b"\xff\ntype:", 1))
+    note.unlink()
+
+    counts = publish(config, db, force=True)
+
+    assert counts["conflict"] == 1
+
+
+def test_protected_note_with_late_transcript_reported_once(config, db, capsys):
+    _, note = _publish_one(config, db)
+    note.write_text(note.read_text() + "\nMine.\n")
+    db.conn.execute("UPDATE asset SET transcript_at = ? WHERE id = ?",
+                    ("2026-10-21T12:00:00Z", ID))
+    db.conn.execute("UPDATE asset SET published_at = '2026-10-21T11:00:00Z' WHERE id = ?", (ID,))
+    db.conn.commit()
+
+    first = publish(config, db)
+    second = publish(config, db)
+
+    assert (first["protected"], second["protected"]) == (1, 0)
+
+
+@pytest.mark.parametrize("uuid_line, bom", [('uuid: "{id}"', ""), ("uuid: {id}", "\ufeff")])
 def test_moved_note_found_despite_quotes_or_bom(config, db, uuid_line, bom):
     asset, note = _publish_one(config, db)
     text = note.read_text().replace(f"uuid: {ID}", uuid_line.format(id=ID))
