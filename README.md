@@ -170,7 +170,7 @@ atlas status                  # Show statistics (total, hours, transcribed, enri
 atlas doctor                  # Health check (dependencies, paths, database)
 atlas health                  # Check Ollama server + model availability
 atlas publish                 # (Re)generate Obsidian notes from database
-atlas publish --force         # Regenerate ALL notes (even unchanged)
+atlas publish --force         # Regenerate all notes; notes edited by hand are left alone
 atlas publish --index-only    # Only update the _Index.md file
 atlas info <uuid>             # Show details for a single asset (prefix match OK)
 ```

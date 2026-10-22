@@ -6,7 +6,7 @@ from typing import List, Optional
 from .config import Config
 from .db import AtlasDB
 from .scanner import scan as do_scan
-from .publisher import publish as do_publish, publish_index, publish_about
+from .publisher import publish as do_publish, publish_index, publish_about, flag_private_copies
 from .transcriber import transcribe_batch
 from .enricher import enrich_batch
 from .philologist import polish_batch, polish_srt, check_ollama_health
@@ -65,7 +65,7 @@ def scan_cmd(
 def publish_cmd(
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
-    force: bool = typer.Option(False, "--force", "-f", help="Regenerate all notes"),
+    force: bool = typer.Option(False, "--force", "-f", help="Regenerate all notes (notes edited by hand are left alone)"),
     index_only: bool = typer.Option(False, "--index-only", help="Only update the index"),
 ):
     """Publish Obsidian notes for scanned assets."""
@@ -89,10 +89,12 @@ def visibility_cmd(
     asset_ids: List[str] = typer.Argument(..., help="Asset UUIDs or unique prefixes (the atlas-id)"),
     config_path: Optional[Path] = typer.Option(None, "--config", "-c"),
 ):
-    """Mark recordings private or public, then rewrite their notes.
+    """Mark recordings private or public, then republish their notes.
 
     Privacy lives in atlas.db so it survives every republish (operations#717).
-    New recordings start unreviewed, which publishes as private.
+    New recordings start unreviewed, which publishes as private. Making a recording
+    private flags every copy of its note in the vault, renamed ones included. A note
+    edited by hand keeps its text, so making it public leaves its flag in place.
     """
     if value not in ("private", "public"):
         print(f"Value must be 'private' or 'public', not {value!r}")
@@ -114,6 +116,10 @@ def visibility_cmd(
         db.conn.commit()
         counts = do_publish(config, db, asset_ids=ids)
         print(f"  {value}: {len(ids)} recording(s); notes: {format_count_line(counts)}")
+        if value == "private":
+            flagged = flag_private_copies(config, db, ids)
+            if flagged:
+                print(f"  flagged {flagged} other cop{'y' if flagged == 1 else 'ies'} of these notes")
 
 
 @app.command()

@@ -143,3 +143,24 @@ def test_publish_only_given_ids(config, db):
     new_dir = config.atlas_vault_dir / "new"
     assert "visibility: private" in (new_dir / a.note_filename).read_text()
     assert "visibility: private" not in (new_dir / b.note_filename).read_text()
+
+
+def test_visibility_private_flags_a_renamed_copy(config, db, monkeypatch):
+    from typer.testing import CliRunner
+    from memoryatlas import cli
+
+    a = _asset()
+    db.upsert_asset(a)
+    db.set_visibility(a.id, "public")
+    db.conn.commit()
+    publish(config, db)
+    note = config.atlas_vault_dir / "new" / a.note_filename
+    renamed = config.atlas_vault_dir / "voice" / "Renamed by hand.md"
+    renamed.write_text(note.read_text() + "\nMy notes.\n")
+
+    monkeypatch.setattr(cli, "_load", lambda path: (config, AtlasDB(config.db_path)))
+    result = CliRunner().invoke(cli.app, ["visibility", "private", a.id])
+
+    assert result.exit_code == 0, result.output
+    assert "visibility: private" in _frontmatter(renamed.read_text())
+    assert renamed.read_text().endswith("\nMy notes.\n")

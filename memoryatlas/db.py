@@ -180,7 +180,11 @@ class AtlasDB:
 
     def get_unpublished_assets(self) -> List[sqlite3.Row]:
         return self.conn.execute(
-            "SELECT * FROM asset WHERE note_path IS NULL ORDER BY recorded_at ASC"
+            # Never published, or published before its transcript landed (a republish
+            # right after transcribing can fail, and nothing else would retry it).
+            "SELECT * FROM asset WHERE note_path IS NULL"
+            " OR (transcript_at IS NOT NULL AND (published_at IS NULL OR transcript_at > published_at))"
+            " ORDER BY recorded_at ASC"
         ).fetchall()
 
     def get_all_assets(self) -> List[sqlite3.Row]:

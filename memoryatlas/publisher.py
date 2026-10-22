@@ -1,6 +1,7 @@
 """Generate Obsidian markdown notes from atlas.db assets."""
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import List, Optional
 
@@ -198,6 +199,7 @@ def generate_note_content(asset: Asset) -> str:
 NOTE_PATH_ROOT = "MemoryAtlas"
 # Files in the vault folder that are not recordings' notes.
 NOT_NOTES = {"_Index.md", "_About.md"}
+PRIVATE_FLAG = "visibility: private"
 
 
 def _content_hash(text: str) -> str:
@@ -212,18 +214,30 @@ def _note_path(config: Config, path: Path) -> str:
     return "/".join((NOTE_PATH_ROOT,) + path.relative_to(config.atlas_vault_dir).parts)
 
 
+def _write_atomic(path: Path, text: str):
+    """Write through a temp file, so a failed write never leaves a truncated note."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.atlas-tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+
+
 def _frontmatter_uuid(path: Path) -> Optional[str]:
     """The uuid in a note's frontmatter, read without loading the rest of the file."""
     try:
-        with path.open(encoding="utf-8") as f:
-            if f.readline().rstrip("\n") != "---":
+        with path.open(encoding="utf-8-sig") as f:
+            if f.readline().rstrip() != "---":
                 return None
             for line in f:
-                line = line.rstrip("\n")
+                line = line.rstrip()
                 if line == "---":
                     return None
                 if line.startswith("uuid:"):
-                    return line.split(":", 1)[1].strip()
+                    return line.split(":", 1)[1].strip().strip("\"'")
     except (OSError, UnicodeDecodeError):
         return None
     return None
@@ -241,24 +255,59 @@ def _notes_by_uuid(config: Config) -> dict:
 
 
 def _with_private_flag(text: str) -> str:
-    """Put `visibility: private` back as line two of a hand-edited note's frontmatter."""
+    """A hand-edited note's text with `visibility: private` in its frontmatter.
+
+    Unchanged when the flag is already anywhere in the frontmatter. Otherwise any other
+    visibility line goes and the flag is put back as line two.
+    """
     lines = text.split("\n")
-    if lines[0] != "---" or "---" not in lines[1:]:
-        return "\n".join(["---", "visibility: private", "---"] + lines)
-    end = lines.index("---", 1)
-    front = [line for line in lines[1:end] if not line.startswith("visibility:")]
-    return "\n".join([lines[0], "visibility: private"] + front + lines[end:])
+    end = next((i for i, line in enumerate(lines[1:], 1) if line.rstrip() == "---"), None)
+    if lines[0].lstrip("﻿").rstrip() != "---" or end is None:
+        return "\n".join(["---", PRIVATE_FLAG, "---"] + lines)
+    front = lines[1:end]
+    if any(line.strip() == PRIVATE_FLAG for line in front):
+        return text
+    front = [line for line in front if not line.startswith("visibility:")]
+    return "\n".join([lines[0], PRIVATE_FLAG] + front + lines[end:])
+
+
+def _flag_copies(copies: List[Path]) -> int:
+    """Add the privacy flag to every copy lacking it; return how many files changed."""
+    changed = 0
+    for path in copies:
+        text = path.read_text(encoding="utf-8")
+        if _with_private_flag(text) != text:
+            _write_atomic(path, _with_private_flag(text))
+            changed += 1
+    return changed
+
+
+def flag_private_copies(config: Config, db: AtlasDB, asset_ids: List[str]) -> int:
+    """Flag every note file of these recordings that are private, wherever it sits.
+
+    publish writes only the note at a recording's recorded path, so a copy renamed by hand
+    elsewhere in the vault would otherwise stay unflagged. Returns files changed.
+    """
+    vault_notes = _notes_by_uuid(config)
+    changed = 0
+    for asset_id in dict.fromkeys(asset_ids):
+        row = db.get_asset(asset_id)
+        if row is not None and row_to_asset(row).is_private:
+            changed += _flag_copies(vault_notes.get(asset_id, []))
+    return changed
 
 
 def publish(config: Config, db: AtlasDB, verbose: bool = False,
             force: bool = False, asset_ids: Optional[List[str]] = None) -> dict:
     """Generate Obsidian notes for assets. With asset_ids, only those notes.
 
-    A note is written where it actually is: a note moved or renamed in the vault is found
-    by the uuid in its frontmatter. A note whose text no longer matches what publish last
-    wrote was edited by hand and is never overwritten, forced or not; only its privacy flag
-    comes back from atlas.db (operations#717). A recording with two notes and neither at
-    its recorded path is a conflict, and nothing is written for it.
+    A note is written where it actually is: a note moved or renamed in the vault, or one
+    atlas.db has lost track of, is found by the uuid in its frontmatter. A note whose text
+    matches neither what publish last wrote nor what it would write now was edited by hand
+    and is never overwritten, forced or not; only its privacy flag comes back from atlas.db
+    (operations#717). A recording with two notes and neither at its recorded path is a
+    conflict: its copies get the privacy flag if they need it, and nothing else is written.
+    Each note's result is committed as it is written.
     """
     counts = {"created": 0, "updated": 0, "skipped": 0, "protected": 0, "conflict": 0, "error": 0}
     vault_notes = None  # read from the vault the first time a note is not where atlas.db says
@@ -273,7 +322,7 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
     new_dir.mkdir(parents=True, exist_ok=True)
 
     if asset_ids:
-        rows = [r for r in (db.get_asset(i) for i in asset_ids) if r is not None]
+        rows = [r for r in (db.get_asset(i) for i in dict.fromkeys(asset_ids)) if r is not None]
     else:
         rows = db.get_all_assets() if force else db.get_unpublished_assets()
 
@@ -283,28 +332,28 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
             content = generate_note_content(asset)
             content_hash = _content_hash(content)
 
-            if asset.note_path:
-                note_path = _vault_path(config, asset.note_path)
-                if not note_path.exists():
-                    if vault_notes is None:
-                        vault_notes = _notes_by_uuid(config)
-                    copies = vault_notes.get(asset.id, [])
-                    if len(copies) > 1:
-                        counts["conflict"] += 1
-                        db.log_action("publish", "conflict", asset_id=asset.id, detail={
-                            "copies": [_note_path(config, c) for c in copies],
-                        })
-                        if verbose:
-                            print(f"  CONFLICT: {len(copies)} notes for {asset.short_id}, none written")
-                        continue
-                    if copies:
-                        note_path = copies[0]  # moved or renamed in the vault
-                    # With no copy left, the note was deleted: write it again where it was.
-            else:
-                # Brand new: goes to the triage inbox. No content-based routing: that was
-                # the mechanism that produced duplicate 3MR files when a classification
-                # flipped between runs.
-                note_path = new_dir / asset.note_filename
+            note_path = _vault_path(config, asset.note_path) if asset.note_path else None
+            if note_path is None or not note_path.exists():
+                if vault_notes is None:
+                    vault_notes = _notes_by_uuid(config)
+                copies = vault_notes.get(asset.id, [])
+                if len(copies) > 1:
+                    counts["conflict"] += 1
+                    if asset.is_private:
+                        _flag_copies(copies)
+                    where = [_note_path(config, c) for c in copies]
+                    db.log_action("publish", "conflict", asset_id=asset.id, detail={"copies": where})
+                    print(f"  conflict, nothing written: {len(copies)} notes for {asset.short_id}: "
+                          + "; ".join(where))
+                    continue
+                if copies:
+                    note_path = copies[0]  # moved or renamed in the vault
+                elif note_path is None:
+                    # Brand new: goes to the triage inbox. No content-based routing: that
+                    # was the mechanism that produced duplicate 3MR files when a
+                    # classification flipped between runs.
+                    note_path = new_dir / asset.note_filename
+                # Otherwise the note was deleted: write it again where it was.
 
             note_filename = note_path.name
             relative_note_path = _note_path(config, note_path)
@@ -312,28 +361,30 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
 
             if note_path.exists():
                 on_disk = note_path.read_text(encoding="utf-8")
+                if _content_hash(on_disk) == content_hash:
+                    # Already holds exactly this text, so there is nothing to write. Record
+                    # the hash in case a run wrote it and stopped before recording.
+                    if asset.note_hash != content_hash:
+                        db.mark_published(asset.id, relative_note_path, content_hash)
+                    elif moved:
+                        db.set_note_path(asset.id, relative_note_path)
+                    counts["skipped"] += 1
+                    continue
                 if _content_hash(on_disk) != asset.note_hash:
                     # Edited by hand since publish last wrote it.
-                    if asset.is_private and _with_private_flag(on_disk) != on_disk:
-                        note_path.write_text(_with_private_flag(on_disk), encoding="utf-8")
+                    if asset.is_private:
+                        _flag_copies([note_path])
                     if moved:
                         db.set_note_path(asset.id, relative_note_path)
                     counts["protected"] += 1
                     db.log_action("publish", "protected", asset_id=asset.id, detail={
                         "note_path": relative_note_path,
                     })
-                    if verbose:
-                        print(f"  protected (edited by hand): {note_filename}")
-                    continue
-                if asset.note_hash == content_hash and not force:
-                    if moved:
-                        db.set_note_path(asset.id, relative_note_path)
-                    counts["skipped"] += 1
+                    print(f"  protected, edited by hand so not overwritten: {relative_note_path}")
                     continue
 
-            note_path.parent.mkdir(parents=True, exist_ok=True)
             is_new = not note_path.exists()
-            note_path.write_text(content, encoding="utf-8")
+            _write_atomic(note_path, content)
 
             db.mark_published(asset.id, relative_note_path, content_hash)
             action = "create" if is_new else "update"
@@ -359,8 +410,9 @@ def publish(config: Config, db: AtlasDB, verbose: bool = False,
                          detail={"error": str(e)})
             if verbose:
                 print(f"  ERROR: {e}")
+        finally:
+            db.conn.commit()
 
-    db.conn.commit()
     db.log_action("publish", "complete", detail=counts)
     db.conn.commit()
 
@@ -452,7 +504,7 @@ MemoryAtlas is a local-first pipeline that ingests voice memos (and later videos
 
 ## Editing Notes
 
-Move, rename or write in any note. Publish finds a moved or renamed note by the `uuid` in its frontmatter and updates it where it is, and it never overwrites a note you have written in. To get a freshly generated note back, delete the note and run `atlas publish --force`.
+Move, rename or write in any note. Publish finds a moved or renamed note by the `uuid` in its frontmatter and updates it where it is, and it never overwrites a note you have written in. To get a freshly generated note back, delete every copy of the note and run `atlas publish --force`.
 
 ## Privacy Model
 
