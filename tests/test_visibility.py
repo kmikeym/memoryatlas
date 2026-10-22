@@ -118,7 +118,8 @@ def test_force_republish_keeps_private_flag(config, db):
     note = config.atlas_vault_dir / "new" / a.note_filename
     assert "visibility: private" in _frontmatter(note.read_text())
 
-    # Hand edits are overwritten by a forced run; the flag must come back from the DB.
+    # Removing the flag by hand is an edit, so a forced run leaves the note alone,
+    # except that the flag must come back from the DB.
     note.write_text(note.read_text().replace("visibility: private\n", ""))
     publish(config, db, force=True)
     assert "visibility: private" in _frontmatter(note.read_text())

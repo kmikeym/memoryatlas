@@ -29,7 +29,8 @@ def transcribe_batch(
 ) -> dict:
     """Transcribe pending voice memos in batch.
 
-    Returns dict with counts: done, failed, skipped, total_seconds.
+    Returns dict with counts: done, failed, skipped, total_seconds, and asset_ids
+    (the ids transcribed by this call, in order).
     """
     import mlx_whisper
 
@@ -51,7 +52,7 @@ def transcribe_batch(
 
     if total == 0:
         print("No pending transcriptions.")
-        return {"done": 0, "failed": 0, "skipped": 0, "total_seconds": 0}
+        return {"done": 0, "failed": 0, "skipped": 0, "total_seconds": 0, "asset_ids": []}
 
     # Summary
     total_duration = sum(r["duration_sec"] for r in rows)
@@ -62,9 +63,10 @@ def transcribe_batch(
 
     if dry_run:
         print("DRY RUN — no transcriptions will be performed.")
-        return {"done": 0, "failed": 0, "skipped": 0, "total_seconds": total_duration}
+        return {"done": 0, "failed": 0, "skipped": 0, "total_seconds": total_duration, "asset_ids": []}
 
-    counts = {"done": 0, "failed": 0, "skipped": 0, "total_seconds": 0}
+    # asset_ids: what this call transcribed, in order, so the caller republishes only those.
+    counts = {"done": 0, "failed": 0, "skipped": 0, "total_seconds": 0, "asset_ids": []}
     batch_start = time.time()
 
     for i, row in enumerate(rows, 1):
@@ -161,6 +163,7 @@ def transcribe_batch(
             db.conn.commit()
 
             counts["done"] += 1
+            counts["asset_ids"].append(asset_id)
             counts["total_seconds"] += duration
 
             if verbose:

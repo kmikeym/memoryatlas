@@ -217,6 +217,10 @@ class AtlasDB:
             (note_path, now, note_hash, asset_id),
         )
 
+    def set_note_path(self, asset_id: str, note_path: str):
+        """Record where a note now lives, without marking it republished."""
+        self.conn.execute("UPDATE asset SET note_path = ? WHERE id = ?", (note_path, asset_id))
+
     def get_stats(self) -> dict:
         row = self.conn.execute("""
             SELECT

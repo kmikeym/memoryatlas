@@ -220,9 +220,11 @@ def transcribe_cmd(
         )
 
         if counts["done"] > 0:
+            # Only the notes just transcribed. Republishing every note with force=True
+            # rewrote all 600-plus of them for each new memo.
             print("\nRepublishing transcribed notes...")
-            pub_counts = do_publish(config, db, force=True)
-            print(f"Notes updated: {pub_counts['updated']}")
+            pub_counts = do_publish(config, db, asset_ids=counts["asset_ids"])
+            print(f"Notes: {format_count_line(pub_counts)}")
             publish_index(config, db)
 
 
